@@ -72,7 +72,7 @@ void lexer(const char *input,
             char c = input[i];
 
              /* End of word */
-            if(isspace((unsigned char)c) || c=='|' ||  c=='<' || c=='>' ||  c=='&')
+            if(isspace((unsigned char)c)||c=='|'||c=='<'||c=='>'||c=='&')
             {
                 break;
             }
