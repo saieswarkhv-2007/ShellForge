@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <termios.h>
+#include <errno.h>
 
 #include "job_control.h"
 
@@ -19,54 +20,64 @@ static pid_t shell_pgid;
 
 void job_control_init(void)
 {
+    pid_t pid;
+
     /*
-     * Shell should be interactive.
+     * If stdin is not a terminal,
+     * job control is not available.
      */
 
     if (!isatty(STDIN_FILENO))
     {
+        shell_pgid = getpid();
+
         return;
     }
 
 
-    shell_pgid = getpid();
+    pid = getpid();
 
 
     /*
-     * Put shell in its own process group.
+     * Ignore interactive terminal signals
+     * in the shell itself.
      */
+
+    signal(SIGTTOU, SIG_IGN);
+    signal(SIGTTIN, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+
+
+    /*
+     * Put shell into its own process group.
+     */
+
+    shell_pgid = pid;
 
     if (setpgid(
             shell_pgid,
             shell_pgid
         ) < 0)
     {
-        /*
-         * It may already be a process-group leader.
-         */
+        if (errno != EACCES &&
+            errno != EPERM)
+        {
+            perror("setpgid");
+        }
     }
 
 
     /*
-     * Give terminal to shell.
+     * Make shell the foreground process group.
      */
 
-    tcsetpgrp(
-        STDIN_FILENO,
-        shell_pgid
-    );
-
-
-    /*
-     * Shell should not be stopped by
-     * terminal job-control signals.
-     */
-
-    signal(SIGTTOU, SIG_IGN);
-
-    signal(SIGTTIN, SIG_IGN);
-
-    signal(SIGTSTP, SIG_IGN);
+    if (tcsetpgrp(
+            STDIN_FILENO,
+            shell_pgid
+        ) < 0)
+    {
+        perror("tcsetpgrp");
+    }
 }
 
 
@@ -76,10 +87,18 @@ void job_control_init(void)
 
 void give_terminal_to(pid_t pgid)
 {
-    tcsetpgrp(
-        STDIN_FILENO,
-        pgid
-    );
+    if (!isatty(STDIN_FILENO))
+    {
+        return;
+    }
+
+    if (tcsetpgrp(
+            STDIN_FILENO,
+            pgid
+        ) < 0)
+    {
+        perror("tcsetpgrp");
+    }
 }
 
 
@@ -89,10 +108,18 @@ void give_terminal_to(pid_t pgid)
 
 void take_terminal_back(void)
 {
-    tcsetpgrp(
-        STDIN_FILENO,
-        shell_pgid
-    );
+    if (!isatty(STDIN_FILENO))
+    {
+        return;
+    }
+
+    if (tcsetpgrp(
+            STDIN_FILENO,
+            shell_pgid
+        ) < 0)
+    {
+        perror("tcsetpgrp");
+    }
 }
 
 

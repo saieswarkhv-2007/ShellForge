@@ -4,13 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-
 #include <unistd.h>
 #include <fcntl.h>
-
 #include <sys/types.h>
 #include <sys/wait.h>
-
 #include <signal.h>
 
 #include "parser.h"
@@ -18,275 +15,169 @@
 #include "builtin.h"
 #include "jobs.h"
 #include "background.h"
+#include "job_control.h"
 
-/* =========================================================   BLOCK SIGCHLD
-
-   Used while creating/waiting for foreground processes.
+/* =========================================================
+   BLOCK SIGCHLD
+   Prevents races while creating/registering jobs.
    ========================================================= */
 
-static int block_sigchld(sigset_t *old_mask)
+static void block_sigchld(sigset_t *oldmask)
 {
-    sigset_t set;
+    sigset_t mask;
 
-    sigemptyset(&set);
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
 
-    sigaddset(&set, SIGCHLD);
-
-    if (sigprocmask(
-            SIG_BLOCK,
-            &set,
-            old_mask
-        ) < 0)
-    {
+    if (sigprocmask(SIG_BLOCK, &mask, oldmask) < 0)
         perror("sigprocmask");
-        return -1;
-    }
-
-    return 0;
 }
-
 
 /* =========================================================
    RESTORE SIGNAL MASK
    ========================================================= */
 
-static void restore_signal_mask(
-    const sigset_t *old_mask
-)
+static void restore_signal_mask(const sigset_t *oldmask)
 {
-    if (sigprocmask(
-            SIG_SETMASK,
-            old_mask,
-            NULL
-        ) < 0)
-    {
+    if (sigprocmask(SIG_SETMASK, oldmask, NULL) < 0)
         perror("sigprocmask");
-    }
 }
 
-
 /* =========================================================
-   APPLY INPUT/OUTPUT REDIRECTION
+   APPLY REDIRECTION
    ========================================================= */
 
 static int apply_redirection(command_t *cmd)
 {
     int fd;
 
-
-    /* =====================================================
-       INPUT REDIRECTION <
-       ===================================================== */
-
     if (cmd->input[0] != '\0')
     {
-        fd = open(
-            cmd->input,
-            O_RDONLY
-        );
+        fd = open(cmd->input, O_RDONLY);
 
         if (fd < 0)
         {
             perror(cmd->input);
-
             return -1;
         }
 
-
-        if (dup2(
-                fd,
-                STDIN_FILENO
-            ) < 0)
+        if (dup2(fd, STDIN_FILENO) < 0)
         {
-            perror("dup2 input");
-
+            perror("dup2");
             close(fd);
-
             return -1;
         }
-
 
         close(fd);
     }
 
-
-    /* =====================================================
-       OUTPUT REDIRECTION > or >>
-       ===================================================== */
-
     if (cmd->output[0] != '\0')
     {
+        int flags = O_WRONLY | O_CREAT;
+
         if (cmd->append)
-        {
-            /* >> */
-
-            fd = open(
-                cmd->output,
-                O_WRONLY |
-                O_CREAT |
-                O_APPEND,
-                0644
-            );
-        }
+            flags |= O_APPEND;
         else
-        {
-            /* > */
+            flags |= O_TRUNC;
 
-            fd = open(
-                cmd->output,
-                O_WRONLY |
-                O_CREAT |
-                O_TRUNC,
-                0644
-            );
-        }
-
+        fd = open(cmd->output, flags, 0644);
 
         if (fd < 0)
         {
             perror(cmd->output);
-
             return -1;
         }
 
-
-        if (dup2(
-                fd,
-                STDOUT_FILENO
-            ) < 0)
+        if (dup2(fd, STDOUT_FILENO) < 0)
         {
-            perror("dup2 output");
-
+            perror("dup2");
             close(fd);
-
             return -1;
         }
-
 
         close(fd);
     }
 
-
     return 0;
 }
 
-
 /* =========================================================
-   PREPARE ARGUMENTS FOR execvp()
+   PREPARE ARGUMENTS
    ========================================================= */
 
-static void prepare_arguments(
-    command_t *cmd,
-    char *args[]
-)
+static void prepare_arguments(command_t *cmd)
 {
-    int i;
-
-    for (i = 0;
-         i < cmd->argc;
-         i++)
-    {
-        args[i] = cmd->argv[i];
-    }
-
-    args[cmd->argc] = NULL;
+    if (cmd->argc < MAX_ARGS)
+        cmd->argv[cmd->argc] = NULL;
+    else
+        cmd->argv[MAX_ARGS - 1] = NULL;
 }
-
 
 /* =========================================================
    EXECUTE BUILTIN WITH REDIRECTION
-
-   This is used for foreground built-ins.
-
-   Example:
-
-       pwd > result.txt
-       echo hello > result.txt
    ========================================================= */
 
-static int execute_builtin_with_redirection(
-    command_t *cmd
-)
+static int execute_builtin_with_redirection(command_t *cmd)
 {
-    int saved_stdin;
-    int saved_stdout;
-
+    int saved_stdin = -1;
+    int saved_stdout = -1;
     int result;
 
-
-    /* Save stdin */
-
-    saved_stdin = dup(STDIN_FILENO);
-
-    if (saved_stdin < 0)
+    if (cmd->input[0] != '\0')
     {
-        perror("dup stdin");
+        saved_stdin = dup(STDIN_FILENO);
 
-        return -1;
+        if (saved_stdin < 0)
+        {
+            perror("dup");
+            return -1;
+        }
     }
 
-
-    /* Save stdout */
-
-    saved_stdout = dup(STDOUT_FILENO);
-
-    if (saved_stdout < 0)
+    if (cmd->output[0] != '\0')
     {
-        perror("dup stdout");
+        saved_stdout = dup(STDOUT_FILENO);
 
-        close(saved_stdin);
-
-        return -1;
+        if (saved_stdout < 0)
+        {
+            perror("dup");
+            if (saved_stdin >= 0)
+                close(saved_stdin);
+            return -1;
+        }
     }
-
-
-    /* Apply redirection */
 
     if (apply_redirection(cmd) < 0)
     {
-        close(saved_stdin);
+        if (saved_stdin >= 0)
+            close(saved_stdin);
 
-        close(saved_stdout);
+        if (saved_stdout >= 0)
+            close(saved_stdout);
 
         return -1;
     }
 
-
-    /* Execute builtin */
-
     result = execute_builtin(cmd);
 
-
-    /* Restore stdin */
-
-    if (dup2(
-            saved_stdin,
-            STDIN_FILENO
-        ) < 0)
+    if (saved_stdin >= 0)
     {
-        perror("restore stdin");
+        if (dup2(saved_stdin, STDIN_FILENO) < 0)
+            perror("dup2");
+
+        close(saved_stdin);
     }
 
-
-    /* Restore stdout */
-
-    if (dup2(
-            saved_stdout,
-            STDOUT_FILENO
-        ) < 0)
+    if (saved_stdout >= 0)
     {
-        perror("restore stdout");
+        if (dup2(saved_stdout, STDOUT_FILENO) < 0)
+            perror("dup2");
+
+        close(saved_stdout);
     }
-
-
-    close(saved_stdin);
-
-    close(saved_stdout);
-
 
     return result;
 }
-
 
 /* =========================================================
    EXECUTE SINGLE COMMAND
@@ -295,774 +186,485 @@ static int execute_builtin_with_redirection(
 int execute_command(command_t *cmd)
 {
     pid_t pid;
-
     int status;
+    sigset_t oldmask;
 
-    sigset_t old_mask;
-
-
-    if (cmd == NULL)
-    {
+    if (cmd == NULL || cmd->argc == 0)
         return -1;
-    }
 
+    prepare_arguments(cmd);
 
-    if (cmd->argc == 0)
-    {
-        return 0;
-    }
-
-
-    /* =====================================================
-       FOREGROUND BUILTIN
-       ===================================================== */
-
-    if (is_builtin(cmd) &&
-        !cmd->background)
-    {
+    /*
+     * Builtins must execute in the shell process when they
+     * are foreground commands. This is necessary for things
+     * such as "cd".
+     */
+    if (is_builtin(cmd) && !cmd->background)
         return execute_builtin_with_redirection(cmd);
-    }
 
-
-    /* =====================================================
-       BLOCK SIGCHLD FOR FOREGROUND COMMAND
-       ===================================================== */
-
-    if (!cmd->background)
-    {
-        if (block_sigchld(
-                &old_mask
-            ) < 0)
-        {
-            return -1;
-        }
-    }
-
-
-    /* =====================================================
-       FORK
-       ===================================================== */
+    /*
+     * Block SIGCHLD while creating/registering the child.
+     */
+    block_sigchld(&oldmask);
 
     pid = fork();
-
 
     if (pid < 0)
     {
         perror("fork");
-
-        if (!cmd->background)
-        {
-            restore_signal_mask(
-                &old_mask
-            );
-        }
-
+        restore_signal_mask(&oldmask);
         return -1;
     }
 
-
-    /* =====================================================
-       CHILD
-       ===================================================== */
-
     if (pid == 0)
     {
-        char *args[MAX_ARGS + 1];
-
-
         /*
-         * Restore signal mask.
+         * Child gets its own process group.
          */
-
-        if (!cmd->background)
+        if (setpgid(0, 0) < 0)
         {
-            restore_signal_mask(
-                &old_mask
-            );
+            /* Ignore harmless race/error here. */
         }
 
-
         /*
-         * Apply redirection.
+         * Restore normal terminal-related signals in child.
          */
+        signal(SIGINT, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGTSTP, SIG_DFL);
+        signal(SIGTTIN, SIG_DFL);
+        signal(SIGTTOU, SIG_DFL);
+
+        restore_signal_mask(&oldmask);
 
         if (apply_redirection(cmd) < 0)
-        {
-            _exit(EXIT_FAILURE);
-        }
-
-
-        /*
-         * Prepare argv.
-         */
-
-        prepare_arguments(
-            cmd,
-            args
-        );
-
-
-        /*
-         * Background builtin runs inside child.
-         */
+            _exit(1);
 
         if (is_builtin(cmd))
         {
-            int result;
-
-            result = execute_builtin(cmd);
-
-            _exit(result);
+            execute_builtin(cmd);
+            _exit(0);
         }
 
+        execvp(cmd->argv[0], cmd->argv);
 
-        /*
-         * External command.
-         */
-
-        execvp(
-            args[0],
-            args
-        );
-
-
-        fprintf(
-            stderr,
-            "shellforge: %s: command not found\n",
-            args[0]
-        );
+        fprintf(stderr, "shellforge: %s: %s\n",
+                cmd->argv[0], strerror(errno));
 
         _exit(127);
     }
 
-
-    /* =====================================================
-       PARENT
-       ===================================================== */
+    /*
+     * Parent also places the child in its own process group.
+     */
+    if (setpgid(pid, pid) < 0)
+    {
+        if (errno != EACCES && errno != ESRCH)
+            perror("setpgid");
+    }
 
     if (cmd->background)
     {
         int job_id;
 
+        job_id = job_add(pid, cmd->argv[0], JOB_RUNNING);
 
-        /*
-         * Make the child its own process group.
-         */
-
-        setpgid(
-            pid,
-            pid
-        );
-
-
-        /*
-         * Add to job table.
-         */
-
-        job_id = job_add(
-            pid,
-            cmd->argv[0],
-            JOB_RUNNING
-        );
-
-
-        if (job_id > 0)
+        if (job_id < 0)
         {
-            printf(
-                "[%d] %d\n",
-                job_id,
-                pid
-            );
-
-            fflush(stdout);
+            fprintf(stderr, "shellforge: failed to add job\n");
+            kill(-pid, SIGTERM);
+            restore_signal_mask(&oldmask);
+            return -1;
         }
 
+        printf("[%d] %d\n", job_id, pid);
+        fflush(stdout);
 
-        /*
-         * IMPORTANT:
-         * Do not wait.
-         */
-
+        restore_signal_mask(&oldmask);
         return 0;
     }
 
+    /*
+     * Foreground process gets terminal control.
+     */
+    give_terminal_to(pid);
 
-    /* =====================================================
-       FOREGROUND WAIT
-       ===================================================== */
-
-    if (waitpid(
-            pid,
-            &status,
-            0
-        ) < 0)
+    /*
+     * Wait for the foreground process.
+     *
+     * WUNTRACED lets us detect Ctrl-Z.
+     */
+    if (waitpid(pid, &status, WUNTRACED) < 0)
     {
-        perror("waitpid");
-
-        restore_signal_mask(
-            &old_mask
-        );
-
-        return -1;
+        if (errno != EINTR)
+            perror("waitpid");
     }
 
+    /*
+     * Return terminal control to shell.
+     */
+    take_terminal_back();
 
-    restore_signal_mask(
-        &old_mask
-    );
+    if (WIFSTOPPED(status))
+    {
+        job_add(pid, cmd->argv[0], JOB_STOPPED);
+        printf("\n[%d]+  Stopped    %s\n",
+               job_find_by_pgid(pid) ?
+               job_find_by_pgid(pid)->job_id : 0,
+               cmd->argv[0]);
+        fflush(stdout);
+    }
+    else if (WIFEXITED(status) || WIFSIGNALED(status))
+    {
+        job_t *job = job_find_by_pgid(pid);
 
+        if (job != NULL)
+            job_remove(job->job_id);
+    }
 
-    /* Return exit status */
+    restore_signal_mask(&oldmask);
 
     if (WIFEXITED(status))
-    {
         return WEXITSTATUS(status);
-    }
-
 
     if (WIFSIGNALED(status))
-    {
-        return 128 +
-               WTERMSIG(status);
-    }
+        return 128 + WTERMSIG(status);
 
-
-    return -1;
+    return 0;
 }
-
 
 /* =========================================================
    EXECUTE PIPELINE
    ========================================================= */
 
-int execute_pipeline(
-    pipeline_t *pipeline
-)
+int execute_pipeline(pipeline_t *pipeline)
 {
-    int command_count;
-
-    int previous_read = -1;
-
-    pid_t pids[MAX_COMMANDS];
-
-    int status;
-
-    int final_status = 0;
-
+    int n;
     int i;
-
+    int pipes[MAX_COMMANDS - 1][2];
+    pid_t pids[MAX_COMMANDS];
+    pid_t pgid = 0;
+    int status = 0;
+    int last_status = 0;
     int background;
-
-    sigset_t old_mask;
-
-
-    /* =====================================================
-       VALIDATE
-       ===================================================== */
+    sigset_t oldmask;
 
     if (pipeline == NULL)
-    {
         return -1;
-    }
 
+    n = pipeline->command_count;
 
-    command_count =
-        pipeline->command_count;
-
-
-    if (command_count <= 0)
-    {
+    if (n <= 0)
         return 0;
-    }
 
+    /*
+     * A single command can use the normal command path.
+     */
+    if (n == 1)
+        return execute_command(&pipeline->commands[0]);
 
-    /* =====================================================
-       BACKGROUND STATUS
+    background = pipeline->commands[n - 1].background;
 
-       IMPORTANT:
-
-       pipeline_t has no background member.
-
-       '&' is stored in the last command.
-       ===================================================== */
-
-    background =
-        pipeline
-            ->commands[
-                command_count - 1
-            ]
-            .background;
-
-
-    /* =====================================================
-       SINGLE COMMAND
-       ===================================================== */
-
-    if (command_count == 1)
+    /*
+     * Create all required pipes.
+     */
+    for (i = 0; i < n - 1; i++)
     {
-        return execute_command(
-            &pipeline->commands[0]
-        );
-    }
-
-
-    /* =====================================================
-       BLOCK SIGCHLD FOR FOREGROUND PIPELINE
-       ===================================================== */
-
-    if (!background)
-    {
-        if (block_sigchld(
-                &old_mask
-            ) < 0)
+        if (pipe(pipes[i]) < 0)
         {
+            perror("pipe");
+
+            while (--i >= 0)
+            {
+                close(pipes[i][0]);
+                close(pipes[i][1]);
+            }
+
             return -1;
         }
     }
 
+    /*
+     * Block SIGCHLD while creating the complete pipeline.
+     */
+    block_sigchld(&oldmask);
 
-    /* =====================================================
-       CREATE PIPELINE
-       ===================================================== */
-
-    for (i = 0;
-         i < command_count;
-         i++)
+    for (i = 0; i < n; i++)
     {
-        int pipefd[2];
+        pid_t pid = fork();
 
-
-        /* =================================================
-           CREATE PIPE
-
-           No pipe is required after final command.
-           ================================================= */
-
-        if (i < command_count - 1)
-        {
-            if (pipe(pipefd) < 0)
-            {
-                perror("pipe");
-
-                if (!background)
-                {
-                    restore_signal_mask(
-                        &old_mask
-                    );
-                }
-
-                return -1;
-            }
-        }
-
-
-        /* =================================================
-           FORK
-           ================================================= */
-
-        pids[i] = fork();
-
-
-        if (pids[i] < 0)
+        if (pid < 0)
         {
             perror("fork");
 
-            if (!background)
+            for (int j = 0; j < n - 1; j++)
             {
-                restore_signal_mask(
-                    &old_mask
-                );
+                close(pipes[j][0]);
+                close(pipes[j][1]);
             }
 
+            restore_signal_mask(&oldmask);
             return -1;
         }
 
-
-        /* =================================================
-           CHILD
-           ================================================= */
-
-        if (pids[i] == 0)
+        if (pid == 0)
         {
-            command_t *cmd;
-
-            char *args[MAX_ARGS + 1];
-
-            int j;
-
-
-            cmd =
-                &pipeline->commands[i];
-
-
             /*
-             * =============================================
-             * PROCESS GROUP
-             * =============================================
+             * First child becomes process-group leader.
              */
-
             if (i == 0)
             {
-                /*
-                 * First process becomes process-group
-                 * leader.
-                 */
-
-                if (setpgid(
-                        0,
-                        0
-                    ) < 0)
+                if (setpgid(0, 0) < 0)
                 {
-                    perror("setpgid");
+                    /* Ignore harmless errors. */
                 }
             }
             else
             {
-                /*
-                 * Remaining processes join first
-                 * process's group.
-                 */
-
-                if (setpgid(
-                        0,
-                        pids[0]
-                    ) < 0)
+                if (setpgid(0, pgid) < 0)
                 {
-                    perror("setpgid");
+                    /* Ignore harmless errors. */
                 }
             }
-
 
             /*
-             * Restore signal mask.
+             * Restore normal signal behavior.
              */
+            signal(SIGINT, SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
+            signal(SIGTTIN, SIG_DFL);
+            signal(SIGTTOU, SIG_DFL);
 
-            if (!background)
+            /*
+             * Connect stdin from previous pipe.
+             */
+            if (i > 0)
             {
-                restore_signal_mask(
-                    &old_mask
-                );
-            }
-
-
-            /* =============================================
-               INPUT FROM PREVIOUS PIPE
-               ============================================= */
-
-            if (previous_read != -1)
-            {
-                if (dup2(
-                        previous_read,
-                        STDIN_FILENO
-                    ) < 0)
+                if (dup2(pipes[i - 1][0], STDIN_FILENO) < 0)
                 {
-                    perror(
-                        "dup2 previous pipe"
-                    );
-
-                    _exit(EXIT_FAILURE);
+                    perror("dup2");
+                    _exit(1);
                 }
             }
 
-
-            /* =============================================
-               OUTPUT TO NEXT PIPE
-               ============================================= */
-
-            if (i < command_count - 1)
+            /*
+             * Connect stdout to next pipe.
+             */
+            if (i < n - 1)
             {
-                if (dup2(
-                        pipefd[1],
-                        STDOUT_FILENO
-                    ) < 0)
+                if (dup2(pipes[i][1], STDOUT_FILENO) < 0)
                 {
-                    perror(
-                        "dup2 next pipe"
-                    );
-
-                    _exit(EXIT_FAILURE);
+                    perror("dup2");
+                    _exit(1);
                 }
             }
 
-
-            /* =============================================
-               CLOSE PREVIOUS PIPE
-               ============================================= */
-
-            if (previous_read != -1)
+            /*
+             * Close all pipe descriptors after dup2.
+             */
+            for (int j = 0; j < n - 1; j++)
             {
-                close(previous_read);
+                close(pipes[j][0]);
+                close(pipes[j][1]);
             }
 
+            if (apply_redirection(&pipeline->commands[i]) < 0)
+                _exit(1);
 
-            /* =============================================
-               CLOSE CURRENT PIPE
-               ============================================= */
+            prepare_arguments(&pipeline->commands[i]);
 
-            if (i < command_count - 1)
+            restore_signal_mask(&oldmask);
+
+            if (is_builtin(&pipeline->commands[i]))
             {
-                close(pipefd[0]);
-
-                close(pipefd[1]);
+                execute_builtin(&pipeline->commands[i]);
+                _exit(0);
             }
 
+            execvp(pipeline->commands[i].argv[0],
+                   pipeline->commands[i].argv);
 
-            /* =============================================
-               FILE REDIRECTION
-               ============================================= */
-
-            if (apply_redirection(cmd) < 0)
-            {
-                _exit(EXIT_FAILURE);
-            }
-
-
-            /* =============================================
-               PREPARE ARGUMENTS
-               ============================================= */
-
-            for (j = 0;
-                 j < cmd->argc;
-                 j++)
-            {
-                args[j] =
-                    cmd->argv[j];
-            }
-
-            args[cmd->argc] =
-                NULL;
-
-
-            /* =============================================
-               BUILTIN
-               ============================================= */
-
-            if (is_builtin(cmd))
-            {
-                int result;
-
-                result =
-                    execute_builtin(cmd);
-
-                _exit(result);
-            }
-
-
-            /* =============================================
-               EXTERNAL COMMAND
-               ============================================= */
-
-            execvp(
-                args[0],
-                args
-            );
-
-
-            fprintf(
-                stderr,
-                "shellforge: %s: command not found\n",
-                args[0]
-            );
+            fprintf(stderr,
+                    "shellforge: %s: %s\n",
+                    pipeline->commands[i].argv[0],
+                    strerror(errno));
 
             _exit(127);
         }
 
-
-        /* =================================================
-           PARENT
-           ================================================= */
-
+        pids[i] = pid;
 
         /*
-         * Establish process group in parent too.
-
-         * This avoids a race between parent and child.
+         * Establish the process group from the parent too.
          */
-
         if (i == 0)
         {
-            setpgid(
-                pids[i],
-                pids[i]
-            );
-        }
-        else
-        {
-            setpgid(
-                pids[i],
-                pids[0]
-            );
+            pgid = pid;
         }
 
-
-        /* ================================================
-           CLOSE PREVIOUS READ END
-           ================================================ */
-
-        if (previous_read != -1)
+        if (setpgid(pid, pgid) < 0)
         {
-            close(previous_read);
-
-            previous_read = -1;
-        }
-
-
-        /* ================================================
-           SAVE READ END FOR NEXT COMMAND
-           ================================================ */
-
-        if (i < command_count - 1)
-        {
-            close(pipefd[1]);
-
-            previous_read =
-                pipefd[0];
+            if (errno != EACCES && errno != ESRCH)
+                perror("setpgid");
         }
     }
 
-
-    /* =====================================================
-       BACKGROUND PIPELINE
-       ===================================================== */
+    /*
+     * Parent no longer needs pipe descriptors.
+     */
+    for (i = 0; i < n - 1; i++)
+    {
+        close(pipes[i][0]);
+        close(pipes[i][1]);
+    }
 
     if (background)
     {
+        char command[MAX_JOB_COMMAND];
+        size_t used = 0;
         int job_id;
 
-        char command_string[MAX_JOB_COMMAND];
+        command[0] = '\0';
 
-
-        /*
-         * Build a simple command description.
-         */
-
-        command_string[0] =
-            '\0';
-
-
-        for (i = 0;
-             i < command_count;
-             i++)
+        for (i = 0; i < n; i++)
         {
-            command_t *cmd;
+            if (pipeline->commands[i].argc == 0)
+                continue;
 
-            cmd =
-                &pipeline->commands[i];
-
-
-            if (i > 0)
+            if (used > 0 && used + 1 < sizeof(command))
             {
-                strncat(
-                    command_string,
-                    " | ",
-                    sizeof(command_string)
-                    -
-                    strlen(command_string)
-                    - 1
-                );
+                command[used++] = ' ';
+                command[used] = '\0';
             }
 
-
-            if (cmd->argc > 0)
+            for (int j = 0;
+                 j < pipeline->commands[i].argc;
+                 j++)
             {
-                strncat(
-                    command_string,
-                    cmd->argv[0],
-                    sizeof(command_string)
-                    -
-                    strlen(command_string)
-                    - 1
-                );
+                size_t len =
+                    strlen(pipeline->commands[i].argv[j]);
+
+                if (used + len + 1 >= sizeof(command))
+                    break;
+
+                memcpy(command + used,
+                       pipeline->commands[i].argv[j],
+                       len);
+
+                used += len;
+                command[used] = '\0';
+
+                if (j + 1 < pipeline->commands[i].argc &&
+                    used + 1 < sizeof(command))
+                {
+                    command[used++] = ' ';
+                    command[used] = '\0';
+                }
             }
         }
 
+        job_id = job_add(pgid, command, JOB_RUNNING);
 
-        /*
-         * Add pipeline as one job.
-
-         * pids[0] is the process-group ID.
-         */
-
-        job_id =
-            job_add(
-                pids[0],
-                command_string,
-                JOB_RUNNING
-            );
-
-
-        if (job_id > 0)
+        if (job_id < 0)
         {
-            printf(
-                "[%d] %d\n",
-                job_id,
-                pids[0]
-            );
-
-            fflush(stdout);
+            fprintf(stderr, "shellforge: failed to add job\n");
+            kill(-pgid, SIGTERM);
+            restore_signal_mask(&oldmask);
+            return -1;
         }
 
+        printf("[%d] %d\n", job_id, pgid);
+        fflush(stdout);
 
-        /*
-         * DO NOT WAIT.
-         */
-
+        restore_signal_mask(&oldmask);
         return 0;
     }
 
+    /*
+     * Give terminal control to the complete pipeline.
+     */
+    give_terminal_to(pgid);
 
-    /* =====================================================
-       FOREGROUND PIPELINE
-       ===================================================== */
-
-    for (i = 0;
-         i < command_count;
-         i++)
+    /*
+     * Wait for every process in the foreground process group.
+     *
+     * WUNTRACED allows Ctrl-Z to stop the pipeline.
+     */
+    for (i = 0; i < n; i++)
     {
-        status = 0;
+        pid_t waited;
 
+        waited = waitpid(pids[i], &status, WUNTRACED);
 
-        if (waitpid(
-                pids[i],
-                &status,
-                0
-            ) < 0)
+        if (waited < 0)
         {
-            perror("waitpid");
+            if (errno != EINTR)
+                perror("waitpid");
 
             continue;
         }
 
+        if (i == n - 1)
+            last_status = status;
 
-        /*
-         * Return status of final command.
-         */
-
-        if (i == command_count - 1)
+        if (WIFSTOPPED(status))
         {
-            if (WIFEXITED(status))
+            /*
+             * Stop the complete pipeline if one process stops.
+             */
+            kill(-pgid, SIGTSTP);
+            break;
+        }
+    }
+
+    /*
+     * If one process stopped, make sure the remaining processes
+     * in the pipeline are stopped too.
+     */
+    if (WIFSTOPPED(status))
+    {
+        job_add(pgid,
+                pipeline->commands[0].argv[0],
+                JOB_STOPPED);
+
+        {
+            job_t *job = job_find_by_pgid(pgid);
+
+            printf("\n[%d]+  Stopped    %s\n",
+                   job ? job->job_id : 0,
+                   pipeline->commands[0].argv[0]);
+        }
+
+        fflush(stdout);
+    }
+    else
+    {
+        /*
+         * Reap remaining foreground processes.
+         */
+        for (i = 0; i < n; i++)
+        {
+            if (waitpid(pids[i], &status, 0) < 0)
             {
-                final_status =
-                    WEXITSTATUS(status);
-            }
-            else if (WIFSIGNALED(status))
-            {
-                final_status =
-                    128 +
-                    WTERMSIG(status);
-            }
-            else
-            {
-                final_status = -1;
+                if (errno != ECHILD && errno != EINTR)
+                    perror("waitpid");
             }
         }
     }
 
+    /*
+     * Give terminal back to shell.
+     */
+    take_terminal_back();
 
-    restore_signal_mask(
-        &old_mask
-    );
+    restore_signal_mask(&oldmask);
 
+    if (WIFEXITED(last_status))
+        return WEXITSTATUS(last_status);
 
-    return final_status;
+    if (WIFSIGNALED(last_status))
+        return 128 + WTERMSIG(last_status);
+
+    return 0;
 }

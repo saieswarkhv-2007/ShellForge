@@ -46,6 +46,8 @@ int job_add(
 
             job_table[i].state = state;
 
+            job_table[i].process_count = 0;
+
             strncpy(
                 job_table[i].command,
                 command,
@@ -60,10 +62,39 @@ int job_add(
         }
     }
 
-
-    printf("jobs: maximum number of jobs reached\n");
+    printf(
+        "jobs: maximum number of jobs reached\n"
+    );
 
     return -1;
+}
+
+
+/* =========================================================
+   ADD PROCESS TO JOB
+   ========================================================= */
+
+void job_add_process(
+    pid_t pgid,
+    pid_t pid
+)
+{
+    job_t *job =
+        job_find_by_pgid(pgid);
+
+    if (job == NULL)
+    {
+        return;
+    }
+
+    if (job->process_count >= MAX_JOB_PROCESSES)
+    {
+        return;
+    }
+
+    job->pids[
+        job->process_count++
+    ] = pid;
 }
 
 
@@ -105,12 +136,41 @@ job_t *job_find_by_pgid(pid_t pgid)
 
 
 /* =========================================================
+   FIND JOB BY PROCESS PID
+   ========================================================= */
+
+job_t *job_find_by_pid(pid_t pid)
+{
+    for (int i = 0; i < MAX_JOBS; i++)
+    {
+        if (job_table[i].job_id == 0)
+        {
+            continue;
+        }
+
+        for (int j = 0;
+             j < job_table[i].process_count;
+             j++)
+        {
+            if (job_table[i].pids[j] == pid)
+            {
+                return &job_table[i];
+            }
+        }
+    }
+
+    return NULL;
+}
+
+
+/* =========================================================
    REMOVE JOB
    ========================================================= */
 
 void job_remove(int job_id)
 {
-    job_t *job = job_find(job_id);
+    job_t *job =
+        job_find(job_id);
 
     if (job != NULL)
     {
@@ -124,7 +184,7 @@ void job_remove(int job_id)
 
 
 /* =========================================================
-   JOB STATE STRING
+   STATE STRING
    ========================================================= */
 
 static const char *state_string(
@@ -151,7 +211,6 @@ static const char *state_string(
 /* =========================================================
    PRINT JOBS
    ========================================================= */
-
 void jobs_print(void)
 {
     for (int i = 0; i < MAX_JOBS; i++)
@@ -172,7 +231,7 @@ void jobs_print(void)
 
 
 /* =========================================================
-   MARK JOB STOPPED
+   MARK STOPPED
    ========================================================= */
 
 void job_stop(pid_t pgid)
@@ -188,7 +247,7 @@ void job_stop(pid_t pgid)
 
 
 /* =========================================================
-   MARK JOB RUNNING
+   MARK RUNNING
    ========================================================= */
 
 void job_continue(pid_t pgid)
@@ -204,7 +263,7 @@ void job_continue(pid_t pgid)
 
 
 /* =========================================================
-   MARK JOB DONE
+   MARK DONE
    ========================================================= */
 
 void job_done(pid_t pgid)

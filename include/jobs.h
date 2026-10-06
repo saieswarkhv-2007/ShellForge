@@ -5,6 +5,7 @@
 
 #define MAX_JOBS 32
 #define MAX_JOB_COMMAND 256
+#define MAX_JOB_PROCESSES 32
 
 typedef enum
 {
@@ -12,7 +13,6 @@ typedef enum
     JOB_STOPPED,
     JOB_DONE
 } job_state_t;
-
 
 typedef struct
 {
@@ -23,6 +23,9 @@ typedef struct
     job_state_t state;
 
     char command[MAX_JOB_COMMAND];
+
+    pid_t pids[MAX_JOB_PROCESSES];
+    int process_count;
 
 } job_t;
 
@@ -37,7 +40,11 @@ int job_add(pid_t pgid,
             job_state_t state);
 
 
-/* Remove a job */
+/* Add a process to an existing job */
+void job_add_process(pid_t pgid, pid_t pid);
+
+
+/* Remove job */
 void job_remove(int job_id);
 
 
@@ -45,23 +52,27 @@ void job_remove(int job_id);
 void jobs_print(void);
 
 
-/* Find job */
+/* Find job by job ID */
 job_t *job_find(int job_id);
 
 
-/* Mark job stopped */
+/* Find job by process group */
+job_t *job_find_by_pgid(pid_t pgid);
+
+
+/* Find job containing a process */
+job_t *job_find_by_pid(pid_t pid);
+
+
+/* Mark stopped */
 void job_stop(pid_t pgid);
 
 
-/* Mark job running */
+/* Mark running */
 void job_continue(pid_t pgid);
 
 
-/* Mark job done */
+/* Mark done */
 void job_done(pid_t pgid);
-
-
-/* Get job by process group */
-job_t *job_find_by_pgid(pid_t pgid);
 
 #endif
